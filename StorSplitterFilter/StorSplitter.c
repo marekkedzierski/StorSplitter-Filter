@@ -2,6 +2,8 @@
 #include <wdf.h>
 #include <ntddscsi.h>
 #include <scsi.h>
+#include <ntddstor.h> 
+#include <ntdddisk.h> // Required for DISK_GEOMETRY and IOCTL_DISK_GET_DRIVE_GEOMETRY
 
 #include <wdmsec.h>
 #pragma comment(lib, "wdmsec.lib")
@@ -31,16 +33,16 @@ typedef struct _CUSTOM_VPD_BLOCK_LIMITS_PAGE
 } CUSTOM_VPD_BLOCK_LIMITS_PAGE, * PCUSTOM_VPD_BLOCK_LIMITS_PAGE;
 #pragma pack(pop)
 
-// ---------------------------------------------------------------------------
-// 2. Context Spaces
-// ---------------------------------------------------------------------------
-typedef struct _FILTER_DEVICE_CONTEXT {
+typedef struct _FILTER_DEVICE_CONTEXT
+{
 	size_t MaxSafeTransferSizeBytes;
+	ULONG SectorSize; // Added to track logical sector size dynamically
 } FILTER_DEVICE_CONTEXT, * PFILTER_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILTER_DEVICE_CONTEXT, GetDeviceContext)
 
-typedef struct _PARENT_REQUEST_CONTEXT {
+typedef struct _PARENT_REQUEST_CONTEXT
+{
 	LONG OutstandingChildren;  // Reference counter
 	NTSTATUS FinalStatus;      // Holds the merged result
 	WDFSPINLOCK Lock;          // Protects the status overwrite
@@ -62,7 +64,7 @@ VOID EvtControlDeviceIoControl(WDFQUEUE Queue, WDFREQUEST Request, size_t Output
 	NTSTATUS status = STATUS_SUCCESS;
 	size_t bytesReturned = 0;
 
-	switch (IoControlCode) 
+	switch (IoControlCode)
 	{
 	case IOCTL_SPLITTER_ENABLE:
 		InterlockedExchange(&g_SplitterEnabled, 1);
@@ -75,15 +77,15 @@ VOID EvtControlDeviceIoControl(WDFQUEUE Queue, WDFREQUEST Request, size_t Output
 		break;
 
 	case IOCTL_SPLITTER_QUERY_STATUS:
-		if (OutputBufferLength < sizeof(LONG)) 
+		if (OutputBufferLength < sizeof(LONG))
 		{
 			status = STATUS_BUFFER_TOO_SMALL;
 		}
-		else 
+		else
 		{
 			LONG* outBuffer = NULL;
 			status = WdfRequestRetrieveOutputBuffer(Request, sizeof(LONG), (PVOID*)&outBuffer, NULL);
-			if (NT_SUCCESS(status)) 
+			if (NT_SUCCESS(status))
 			{
 				*outBuffer = InterlockedCompareExchange(&g_SplitterEnabled, 0, 0);
 				bytesReturned = sizeof(LONG);
@@ -112,7 +114,7 @@ NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 	DECLARE_CONST_UNICODE_STRING(symbolicLinkName, L"\\DosDevices\\StorSplitterCtrl");
 
 	NTSTATUS status = WdfDeviceInitAssignName(deviceInit, &ntDeviceName);
-	if (!NT_SUCCESS(status)) 
+	if (!NT_SUCCESS(status))
 	{
 		WdfDeviceInitFree(deviceInit);
 		return status;
@@ -120,14 +122,14 @@ NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 
 	WDFDEVICE controlDevice;
 	status = WdfDeviceCreate(&deviceInit, WDF_NO_OBJECT_ATTRIBUTES, &controlDevice);
-	if (!NT_SUCCESS(status)) 
+	if (!NT_SUCCESS(status))
 	{
 		WdfDeviceInitFree(deviceInit);
 		return status;
 	}
 
 	status = WdfDeviceCreateSymbolicLink(controlDevice, &symbolicLinkName);
-	if (!NT_SUCCESS(status)) 
+	if (!NT_SUCCESS(status))
 	{
 		WdfObjectDelete(controlDevice);
 		return status;
@@ -138,7 +140,7 @@ NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 	ioQueueConfig.EvtIoDeviceControl = EvtControlDeviceIoControl;
 
 	status = WdfIoQueueCreate(controlDevice, &ioQueueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
-	if (!NT_SUCCESS(status)) 
+	if (!NT_SUCCESS(status))
 	{
 		WdfObjectDelete(controlDevice);
 		return status;
@@ -156,7 +158,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	WDFDRIVER driver;
 	NTSTATUS status = WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &config, &driver);
 
-	if (NT_SUCCESS(status)) 
+	if (NT_SUCCESS(status))
 	{
 		// Create the Control Device endpoint for user-mode apps
 		CreateControlDevice(driver);
@@ -201,6 +203,22 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, W
 	WDFIOTARGET target = WdfDeviceGetIoTarget(Device);
 
 	devCtx->MaxSafeTransferSizeBytes = DEFAULT_MAX_TRANSFER_SIZE;
+	devCtx->SectorSize = 512; // Fallback default
+
+	// Get actual logical sector size via IOCTL_DISK_GET_DRIVE_GEOMETRY
+	DISK_GEOMETRY geometry = { 0 };
+	WDF_MEMORY_DESCRIPTOR geometryDescriptor;
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&geometryDescriptor, &geometry, sizeof(DISK_GEOMETRY));
+
+	NTSTATUS status = WdfIoTargetSendIoctlSynchronously(
+		target, NULL, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+		NULL, &geometryDescriptor, NULL, NULL
+	);
+
+	if (NT_SUCCESS(status) && geometry.BytesPerSector != 0)
+	{
+		devCtx->SectorSize = geometry.BytesPerSector;
+	}
 
 	SCSI_PASS_THROUGH spt = { 0 };
 	spt.Length = sizeof(SCSI_PASS_THROUGH);
@@ -228,24 +246,26 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, W
 	WDF_MEMORY_DESCRIPTOR outputDescriptor;
 	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outputDescriptor, buffer, (ULONG)totalBufferSize);
 
-	NTSTATUS status = WdfIoTargetSendIoctlSynchronously(
+	status = WdfIoTargetSendIoctlSynchronously(
 		target, NULL, IOCTL_SCSI_PASS_THROUGH,
 		&inputDescriptor, &outputDescriptor, NULL, NULL
 	);
 
-	if (NT_SUCCESS(status)) {
+	if (NT_SUCCESS(status))
+	{
 		PSCSI_PASS_THROUGH pSpt = (PSCSI_PASS_THROUGH)buffer;
-		if (pSpt->ScsiStatus == SCSISTAT_GOOD) 
+		if (pSpt->ScsiStatus == SCSISTAT_GOOD)
 		{
 			PCUSTOM_VPD_BLOCK_LIMITS_PAGE pVpd = (PCUSTOM_VPD_BLOCK_LIMITS_PAGE)(buffer + sizeof(SCSI_PASS_THROUGH));
 
-			if (pVpd->PageCode == 0xB0) 
+			if (pVpd->PageCode == 0xB0)
 			{
 				ULONG maxTransferBlocks = _byteswap_ulong(pVpd->MaximumTransferLength);
 
-				if (maxTransferBlocks > 0) 
+				if (maxTransferBlocks > 0)
 				{
-					ULONG maxBytes = maxTransferBlocks * 512;
+					// Use dynamically retrieved logical sector size instead of hardcoded 512
+					ULONG maxBytes = maxTransferBlocks * devCtx->SectorSize;
 					DbgPrint("[SCSI INQUIRY] HW Max Transfer: %u blocks (%u bytes)\n", maxTransferBlocks, maxBytes);
 					devCtx->MaxSafeTransferSizeBytes = maxBytes;
 				}
@@ -264,7 +284,7 @@ VOID EvtChildRequestCompleted(WDFREQUEST ChildRequest, WDFIOTARGET Target, PWDF_
 	PPARENT_REQUEST_CONTEXT parentCtx = GetParentContext(parentRequest);
 	NTSTATUS childStatus = Params->IoStatus.Status;
 
-	if (!NT_SUCCESS(childStatus)) 
+	if (!NT_SUCCESS(childStatus))
 	{
 		WdfSpinLockAcquire(parentCtx->Lock);
 		parentCtx->FinalStatus = childStatus;
@@ -272,7 +292,7 @@ VOID EvtChildRequestCompleted(WDFREQUEST ChildRequest, WDFIOTARGET Target, PWDF_
 	}
 
 	WdfObjectDelete(ChildRequest);
-	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0) 
+	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0)
 	{
 		NTSTATUS finalStatus = parentCtx->FinalStatus;
 
@@ -295,11 +315,12 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 	size_t activeSafeSize = devCtx->MaxSafeTransferSizeBytes;
 
 	// Fast Path: Pass-through if Disabled OR if the request is small enough
-	if (g_SplitterEnabled == 0 || Length <= activeSafeSize) 
+	if (g_SplitterEnabled == 0 || Length <= activeSafeSize)
 	{
 		WDF_REQUEST_SEND_OPTIONS options;
 		WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET);
-		if (!WdfRequestSend(Request, target, &options)) {
+		if (!WdfRequestSend(Request, target, &options))
+		{
 			WdfRequestComplete(Request, WdfRequestGetStatus(Request));
 		}
 		return;
@@ -312,7 +333,8 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
 	WDFMEMORY parentMemory;
 	NTSTATUS status = WdfRequestRetrieveOutputMemory(Request, &parentMemory);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(status))
+	{
 		WdfRequestComplete(Request, status);
 		return;
 	}
@@ -321,8 +343,9 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, PARENT_REQUEST_CONTEXT);
 	PPARENT_REQUEST_CONTEXT parentCtx;
 	status = WdfObjectAllocateContext(Request, &attributes, (PVOID*)&parentCtx);
-	if (!NT_SUCCESS(status)) {
-		WdfRequestComplete(Request, status);
+	if (!NT_SUCCESS(status))
+	{
+		WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
 		return;
 	}
 
@@ -337,13 +360,20 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
 	size_t memoryOffset = 0;
 
-	while (memoryOffset < Length) 
+	while (memoryOffset < Length)
 	{
 		size_t chunkSize = Length - memoryOffset;
 		if (chunkSize > activeSafeSize) chunkSize = activeSafeSize;
 
 		WDFREQUEST childRequest;
-		WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, target, &childRequest);
+		status = WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, target, &childRequest);
+		if (!NT_SUCCESS(status))
+		{
+			WdfSpinLockAcquire(parentCtx->Lock);
+			parentCtx->FinalStatus = STATUS_INSUFFICIENT_RESOURCES;
+			WdfSpinLockRelease(parentCtx->Lock);
+			break;
+		}
 
 		WDFMEMORY_OFFSET memOffset;
 		memOffset.BufferOffset = memoryOffset;
@@ -351,7 +381,8 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
 		status = WdfIoTargetFormatRequestForRead(target, childRequest, parentMemory, &memOffset, &deviceOffset);
 
-		if (!NT_SUCCESS(status)) {
+		if (!NT_SUCCESS(status))
+		{
 			WdfObjectDelete(childRequest);
 			WdfSpinLockAcquire(parentCtx->Lock);
 			parentCtx->FinalStatus = status;
@@ -362,7 +393,8 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		WdfRequestSetCompletionRoutine(childRequest, EvtChildRequestCompleted, Request);
 		InterlockedIncrement(&parentCtx->OutstandingChildren);
 
-		if (!WdfRequestSend(childRequest, target, WDF_NO_SEND_OPTIONS)) {
+		if (!WdfRequestSend(childRequest, target, WDF_NO_SEND_OPTIONS))
+		{
 			status = WdfRequestGetStatus(childRequest);
 			WdfSpinLockAcquire(parentCtx->Lock);
 			parentCtx->FinalStatus = status;
@@ -375,7 +407,8 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		deviceOffset += chunkSize;
 	}
 
-	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0) {
+	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0)
+	{
 		status = parentCtx->FinalStatus;
 		WdfRequestComplete(Request, status);
 	}
@@ -389,11 +422,12 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 	size_t activeSafeSize = devCtx->MaxSafeTransferSizeBytes;
 
 	// Fast Path: Pass-through if Disabled OR if the request is small enough
-	if (g_SplitterEnabled == 0 || Length <= activeSafeSize) 
+	if (g_SplitterEnabled == 0 || Length <= activeSafeSize)
 	{
 		WDF_REQUEST_SEND_OPTIONS options;
 		WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET);
-		if (!WdfRequestSend(Request, target, &options)) {
+		if (!WdfRequestSend(Request, target, &options))
+		{
 			WdfRequestComplete(Request, WdfRequestGetStatus(Request));
 		}
 		return;
@@ -406,7 +440,8 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
 	WDFMEMORY parentMemory;
 	NTSTATUS status = WdfRequestRetrieveInputMemory(Request, &parentMemory);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(status))
+	{
 		WdfRequestComplete(Request, status);
 		return;
 	}
@@ -415,9 +450,9 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, PARENT_REQUEST_CONTEXT);
 	PPARENT_REQUEST_CONTEXT parentCtx;
 	status = WdfObjectAllocateContext(Request, &attributes, (PVOID*)&parentCtx);
-	if (!NT_SUCCESS(status)) 
+	if (!NT_SUCCESS(status))
 	{
-		WdfRequestComplete(Request, status);
+		WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
 		return;
 	}
 
@@ -432,13 +467,20 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
 	size_t memoryOffset = 0;
 
-	while (memoryOffset < Length) 
+	while (memoryOffset < Length)
 	{
 		size_t chunkSize = Length - memoryOffset;
 		if (chunkSize > activeSafeSize) chunkSize = activeSafeSize;
 
 		WDFREQUEST childRequest;
-		WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, target, &childRequest);
+		status = WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, target, &childRequest);
+		if (!NT_SUCCESS(status))
+		{
+			WdfSpinLockAcquire(parentCtx->Lock);
+			parentCtx->FinalStatus = STATUS_INSUFFICIENT_RESOURCES;
+			WdfSpinLockRelease(parentCtx->Lock);
+			break;
+		}
 
 		WDFMEMORY_OFFSET memOffset;
 		memOffset.BufferOffset = memoryOffset;
@@ -446,7 +488,7 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
 		status = WdfIoTargetFormatRequestForWrite(target, childRequest, parentMemory, &memOffset, &deviceOffset);
 
-		if (!NT_SUCCESS(status)) 
+		if (!NT_SUCCESS(status))
 		{
 			WdfObjectDelete(childRequest);
 			WdfSpinLockAcquire(parentCtx->Lock);
@@ -458,7 +500,7 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		WdfRequestSetCompletionRoutine(childRequest, EvtChildRequestCompleted, Request);
 		InterlockedIncrement(&parentCtx->OutstandingChildren);
 
-		if (!WdfRequestSend(childRequest, target, WDF_NO_SEND_OPTIONS)) 
+		if (!WdfRequestSend(childRequest, target, WDF_NO_SEND_OPTIONS))
 		{
 			status = WdfRequestGetStatus(childRequest);
 			WdfSpinLockAcquire(parentCtx->Lock);
@@ -472,7 +514,7 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		deviceOffset += chunkSize;
 	}
 
-	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0) 
+	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0)
 	{
 		status = parentCtx->FinalStatus;
 		WdfRequestComplete(Request, status);

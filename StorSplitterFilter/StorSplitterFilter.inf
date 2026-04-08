@@ -44,6 +44,18 @@ StartType      = 0               ; SERVICE_BOOT_START (Required to intercept boo
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\StorSplitterFilter.sys
 LoadOrderGroup = PnP Filter
+AddReg         = StorSplitterFilter_WDF_Manual_AddReg
+
+; THE WDF MANUAL BINDING BYPASS
+; Because 'DefaultInstall' ignores [Wdf] sections, we must manually create 
+; the KMDF parameters in the driver's service registry key.
+; HKR points to: HKLM\System\CurrentControlSet\Services\StorSplitterFilter
+[StorSplitterFilter_WDF_Manual_AddReg]
+; 0x00000000 = REG_SZ (String)
+HKR, "Parameters\Wdf", "KmdfLibraryVersion", 0x00000000, "1.15"
+; 0x00010001 = REG_DWORD (Number)
+HKR, "Parameters\Wdf", "WdfMajorVersion", 0x00010001, 1
+HKR, "Parameters\Wdf", "WdfMinorVersion", 0x00010001, 15
 
 [Strings]
 ManufacturerName = "Red Hat"

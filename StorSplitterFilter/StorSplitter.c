@@ -1,3 +1,12 @@
+/**
+ * StorSplitter.c
+ * * A WDF Storage Filter Driver that intercepts Read/Write requests.
+ * If a request exceeds the maximum transfer size supported by the underlying
+ * hardware (queried dynamically via SCSI VPD), the driver splits the request
+ * into smaller, safe-sized chunks, dispatches them asynchronously, and
+ * reconstructs the final completion status for the OS.
+ */
+
 #include <ntddk.h>
 #include <wdf.h>
 #include <ntddscsi.h>
@@ -8,15 +17,18 @@
 #include <wdmsec.h>
 #pragma comment(lib, "wdmsec.lib")
 
+ // Default fallback size (63 pages = ~252KB) if hardware querying fails
 #define DEFAULT_MAX_TRANSFER_SIZE (63 * PAGE_SIZE)
 
-// Master Switch: 1 = Enabled (Default), 0 = Disabled
+// Master Switch: 1 = Enabled (Default), 0 = Disabled system-wide.
+// Can be toggled dynamically from user-mode via IOCTLs.
 LONG g_SplitterEnabled = 1;
 
 // Point this to the header that is shared between user and kernel
 #include "../StorSplitterFilter/SharedIoctls.h"
 
 // Standard SCSI VPD Page 0xB0 (Block Limits)
+// Used to ask the storage controller exactly how much data it can handle at once.
 #pragma pack(push, 1)
 typedef struct _CUSTOM_VPD_BLOCK_LIMITS_PAGE
 {
@@ -27,35 +39,39 @@ typedef struct _CUSTOM_VPD_BLOCK_LIMITS_PAGE
 	UCHAR WSNZ;
 	UCHAR MaxCompareAndWriteLength;
 	USHORT OptimalTransferLengthGranularity;
-	ULONG MaximumTransferLength; // Blocks
+	ULONG MaximumTransferLength; // Max hardware transfer size in Blocks/Sectors
 	ULONG OptimalTransferLength;
 	ULONG MaximumPrefetchLength;
 } CUSTOM_VPD_BLOCK_LIMITS_PAGE, * PCUSTOM_VPD_BLOCK_LIMITS_PAGE;
 #pragma pack(pop)
 
+// Attached to the WDFDEVICE. Holds state specific to the physical disk we are filtering.
 typedef struct _FILTER_DEVICE_CONTEXT
 {
-	size_t MaxSafeTransferSizeBytes;
+	size_t MaxSafeTransferSizeBytes; // Calculated max size we are allowed to send
 	ULONG SectorSize; // Added to track logical sector size dynamically
 } FILTER_DEVICE_CONTEXT, * PFILTER_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILTER_DEVICE_CONTEXT, GetDeviceContext)
 
+// Attached to each large WDFREQUEST (the Parent). Tracks the progress of the split pieces.
 typedef struct _PARENT_REQUEST_CONTEXT
 {
-	LONG OutstandingChildren;  // Reference counter
-	NTSTATUS FinalStatus;      // Holds the merged result
-	WDFSPINLOCK Lock;          // Protects the status overwrite
+	LONG OutstandingChildren;  // Reference counter: how many pieces are still in flight?
+	NTSTATUS FinalStatus;      // Holds the merged result (if any child fails, this records the failure)
+	WDFSPINLOCK Lock;          // Thread-safe lock to protect FinalStatus overwrites from concurrent callbacks
 } PARENT_REQUEST_CONTEXT, * PPARENT_REQUEST_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(PARENT_REQUEST_CONTEXT, GetParentContext)
 
+// Forward declarations of WDF Event Callbacks
 EVT_WDF_DRIVER_DEVICE_ADD EvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE EvtDevicePrepareHardware;
 EVT_WDF_IO_QUEUE_IO_READ EvtIoRead;
 EVT_WDF_IO_QUEUE_IO_WRITE EvtIoWrite;
 EVT_WDF_REQUEST_COMPLETION_ROUTINE EvtChildRequestCompleted;
 
+// Handles IOCTLs sent from user-mode applications (e.g., a GUI or CLI tool)
 VOID EvtControlDeviceIoControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode)
 {
 	UNREFERENCED_PARAMETER(Queue);
@@ -84,6 +100,7 @@ VOID EvtControlDeviceIoControl(WDFQUEUE Queue, WDFREQUEST Request, size_t Output
 		else
 		{
 			LONG* outBuffer = NULL;
+			// Retrieve the memory buffer provided by the user-mode app
 			status = WdfRequestRetrieveOutputBuffer(Request, sizeof(LONG), (PVOID*)&outBuffer, NULL);
 			if (NT_SUCCESS(status))
 			{
@@ -101,8 +118,11 @@ VOID EvtControlDeviceIoControl(WDFQUEUE Queue, WDFREQUEST Request, size_t Output
 	WdfRequestCompleteWithInformation(Request, status, bytesReturned);
 }
 
+// Creates a standalone "Control Device" side-by-side with the filter.
+// This allows user-mode apps to communicate with the driver even if the storage volumes are locked.
 NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 {
+	// SDDL string restricts access: SYSTEM and Built-in Administrators get Full Access (GA)
 	DECLARE_CONST_UNICODE_STRING(sddlString, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 
 	PWDFDEVICE_INIT deviceInit = WdfControlDeviceInitAllocate(Driver, &sddlString);
@@ -110,6 +130,7 @@ NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 
 	WdfDeviceInitSetExclusive(deviceInit, TRUE);
 
+	// The names required for user-mode to open a handle
 	DECLARE_CONST_UNICODE_STRING(ntDeviceName, L"\\Device\\StorSplitterCtrl");
 	DECLARE_CONST_UNICODE_STRING(symbolicLinkName, L"\\DosDevices\\StorSplitterCtrl");
 
@@ -135,6 +156,7 @@ NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 		return status;
 	}
 
+	// Set up a sequential queue purely for handling user-mode IOCTLs
 	WDF_IO_QUEUE_CONFIG ioQueueConfig;
 	WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&ioQueueConfig, WdfIoQueueDispatchSequential);
 	ioQueueConfig.EvtIoDeviceControl = EvtControlDeviceIoControl;
@@ -150,10 +172,11 @@ NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 	return STATUS_SUCCESS;
 }
 
+// The absolute entry point for the kernel driver.
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
 	WDF_DRIVER_CONFIG config;
-	WDF_DRIVER_CONFIG_INIT(&config, EvtDeviceAdd);
+	WDF_DRIVER_CONFIG_INIT(&config, EvtDeviceAdd); // Register the AddDevice callback
 
 	WDFDRIVER driver;
 	NTSTATUS status = WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &config, &driver);
@@ -167,18 +190,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	return status;
 }
 
+// Called every time the Plug-and-Play manager discovers a storage device in the driver stack.
 NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 {
 	UNREFERENCED_PARAMETER(Driver);
 	NTSTATUS status;
 
+	// Tell WDF that we are acting as a Filter driver, not a Function driver.
 	WdfFdoInitSetFilter(DeviceInit);
 
+	// Register PnP callbacks so we know when the hardware is powered up and ready to be queried
 	WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
 	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
 	pnpCallbacks.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
 	WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
 
+	// Allocate our per-device context space
 	WDF_OBJECT_ATTRIBUTES deviceAttributes;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, FILTER_DEVICE_CONTEXT);
 
@@ -186,6 +213,7 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 	status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &device);
 	if (!NT_SUCCESS(status)) return status;
 
+	// Set up a parallel queue to intercept Read and Write operations concurrently.
 	WDF_IO_QUEUE_CONFIG queueConfig;
 	WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
 	queueConfig.EvtIoRead = EvtIoRead;
@@ -194,6 +222,7 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 	return WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
 }
 
+// Called after the device is powered up. Perfect time to query hardware limits.
 NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, WDFCMRESLIST ResourcesTranslated)
 {
 	UNREFERENCED_PARAMETER(ResourcesRaw);
@@ -202,10 +231,11 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, W
 	PFILTER_DEVICE_CONTEXT devCtx = GetDeviceContext(Device);
 	WDFIOTARGET target = WdfDeviceGetIoTarget(Device);
 
+	// Set safe defaults just in case the hardware queries fail
 	devCtx->MaxSafeTransferSizeBytes = DEFAULT_MAX_TRANSFER_SIZE;
 	devCtx->SectorSize = 512; // Fallback default
 
-	// Get actual logical sector size via IOCTL_DISK_GET_DRIVE_GEOMETRY
+	// Step 1: Get actual logical sector size via IOCTL_DISK_GET_DRIVE_GEOMETRY
 	DISK_GEOMETRY geometry = { 0 };
 	WDF_MEMORY_DESCRIPTOR geometryDescriptor;
 	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&geometryDescriptor, &geometry, sizeof(DISK_GEOMETRY));
@@ -217,9 +247,10 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, W
 
 	if (NT_SUCCESS(status) && geometry.BytesPerSector != 0)
 	{
-		devCtx->SectorSize = geometry.BytesPerSector;
+		devCtx->SectorSize = geometry.BytesPerSector; // Will properly detect 4Kn drives
 	}
 
+	// Step 2: Query SCSI VPD Page 0xB0 (Block Limits)
 	SCSI_PASS_THROUGH spt = { 0 };
 	spt.Length = sizeof(SCSI_PASS_THROUGH);
 	spt.CdbLength = 6;
@@ -228,15 +259,17 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, W
 	spt.TimeOutValue = 2;
 	spt.DataBufferOffset = sizeof(SCSI_PASS_THROUGH);
 
+	// Craft the raw SCSI Command Descriptor Block (CDB)
 	spt.Cdb[0] = SCSIOP_INQUIRY;
-	spt.Cdb[1] = 0x01;
-	spt.Cdb[2] = 0xB0;
+	spt.Cdb[1] = 0x01; // Enable Vital Product Data (EVPD)
+	spt.Cdb[2] = 0xB0; // The Block Limits page
 	spt.Cdb[4] = sizeof(CUSTOM_VPD_BLOCK_LIMITS_PAGE);
 
 	size_t totalBufferSize = sizeof(SCSI_PASS_THROUGH) + sizeof(CUSTOM_VPD_BLOCK_LIMITS_PAGE);
 
+	// Use Non-Paged pool because we are doing hardware I/O
 	PUCHAR buffer = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, totalBufferSize, 'IPDS');
-	if (!buffer) return STATUS_SUCCESS;
+	if (!buffer) return STATUS_SUCCESS; // Silently fail and use defaults
 
 	RtlCopyMemory(buffer, &spt, sizeof(SCSI_PASS_THROUGH));
 
@@ -260,6 +293,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, W
 
 			if (pVpd->PageCode == 0xB0)
 			{
+				// SCSI returns big-endian values, we must byte-swap to Windows little-endian
 				ULONG maxTransferBlocks = _byteswap_ulong(pVpd->MaximumTransferLength);
 
 				if (maxTransferBlocks > 0)
@@ -277,13 +311,15 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, W
 	return STATUS_SUCCESS;
 }
 
+// Callback invoked asynchronously when one of our split "Child" chunks finishes at the hardware level.
 VOID EvtChildRequestCompleted(WDFREQUEST ChildRequest, WDFIOTARGET Target, PWDF_REQUEST_COMPLETION_PARAMS Params, WDFCONTEXT Context)
 {
 	UNREFERENCED_PARAMETER(Target);
-	WDFREQUEST parentRequest = (WDFREQUEST)Context;
+	WDFREQUEST parentRequest = (WDFREQUEST)Context; // Context contains the original huge request
 	PPARENT_REQUEST_CONTEXT parentCtx = GetParentContext(parentRequest);
 	NTSTATUS childStatus = Params->IoStatus.Status;
 
+	// If this chunk failed, record the failure. Protect with a spinlock since chunks complete concurrently on different CPU cores.
 	if (!NT_SUCCESS(childStatus))
 	{
 		WdfSpinLockAcquire(parentCtx->Lock);
@@ -291,7 +327,10 @@ VOID EvtChildRequestCompleted(WDFREQUEST ChildRequest, WDFIOTARGET Target, PWDF_
 		WdfSpinLockRelease(parentCtx->Lock);
 	}
 
-	WdfObjectDelete(ChildRequest);
+	WdfObjectDelete(ChildRequest); // Free the memory used by this sub-request
+
+	// Atomically decrement the active chunk counter. 
+	// If it hits 0, all chunks are done, and we can finally complete the parent.
 	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0)
 	{
 		NTSTATUS finalStatus = parentCtx->FinalStatus;
@@ -300,9 +339,11 @@ VOID EvtChildRequestCompleted(WDFREQUEST ChildRequest, WDFIOTARGET Target, PWDF_
 		WDF_REQUEST_PARAMETERS_INIT(&parentParams);
 		WdfRequestGetParameters(parentRequest, &parentParams);
 
+		// Calculate how many bytes we technically completed for the OS
 		size_t bytesCompleted = NT_SUCCESS(finalStatus) ?
 			(parentParams.Type == WdfRequestTypeRead ? parentParams.Parameters.Read.Length : parentParams.Parameters.Write.Length) : 0;
 
+		// Inform the OS that the original massive request is done
 		WdfRequestCompleteWithInformation(parentRequest, finalStatus, bytesCompleted);
 	}
 }
@@ -314,7 +355,8 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 	PFILTER_DEVICE_CONTEXT devCtx = GetDeviceContext(device);
 	size_t activeSafeSize = devCtx->MaxSafeTransferSizeBytes;
 
-	// Fast Path: Pass-through if Disabled OR if the request is small enough
+	// FAST PATH: If the splitter is disabled, or the request is naturally small enough, 
+	// just pass it down the stack immediately. Send-and-Forget means we don't even wait for the result.
 	if (g_SplitterEnabled == 0 || Length <= activeSafeSize)
 	{
 		WDF_REQUEST_SEND_OPTIONS options;
@@ -326,12 +368,13 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		return;
 	}
 
+	// SPLIT PATH: The request is too large. We must slice it.
 	WDF_REQUEST_PARAMETERS params;
 	WDF_REQUEST_PARAMETERS_INIT(&params);
 	WdfRequestGetParameters(Request, &params);
 	LONGLONG deviceOffset = params.Parameters.Read.DeviceOffset;
 
-	WDFMEMORY parentMemory;
+	WDFMEMORY parentMemory; // The giant buffer the OS wants us to read into
 	NTSTATUS status = WdfRequestRetrieveOutputMemory(Request, &parentMemory);
 	if (!NT_SUCCESS(status))
 	{
@@ -339,46 +382,55 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		return;
 	}
 
+	// Allocate a tracking context for the Parent request
 	WDF_OBJECT_ATTRIBUTES attributes;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, PARENT_REQUEST_CONTEXT);
 	PPARENT_REQUEST_CONTEXT parentCtx;
 	status = WdfObjectAllocateContext(Request, &attributes, (PVOID*)&parentCtx);
 	if (!NT_SUCCESS(status))
 	{
+		// INSUFFICIENT RESOURCES GUARD: Graceful failure if the system is out of memory
 		WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
 		return;
 	}
 
 	parentCtx->FinalStatus = STATUS_SUCCESS;
 
+	// Create a spinlock to safely update FinalStatus later
 	WDF_OBJECT_ATTRIBUTES lockAttributes;
 	WDF_OBJECT_ATTRIBUTES_INIT(&lockAttributes);
 	lockAttributes.ParentObject = Request;
 	WdfSpinLockCreate(&lockAttributes, &parentCtx->Lock);
 
+	// LOOP BIAS: We start the counter at 1. This prevents the request from completing 
+	// prematurely if chunk #1 finishes processing before we even finish submitting chunk #2.
 	parentCtx->OutstandingChildren = 1;
 
 	size_t memoryOffset = 0;
 
+	// Slicing loop
 	while (memoryOffset < Length)
 	{
 		size_t chunkSize = Length - memoryOffset;
-		if (chunkSize > activeSafeSize) chunkSize = activeSafeSize;
+		if (chunkSize > activeSafeSize) chunkSize = activeSafeSize; // Clamp size to hardware max
 
 		WDFREQUEST childRequest;
 		status = WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, target, &childRequest);
 		if (!NT_SUCCESS(status))
 		{
+			// INSUFFICIENT RESOURCES GUARD: If we run out of memory mid-split, abort.
 			WdfSpinLockAcquire(parentCtx->Lock);
 			parentCtx->FinalStatus = STATUS_INSUFFICIENT_RESOURCES;
 			WdfSpinLockRelease(parentCtx->Lock);
 			break;
 		}
 
+		// Map the child's buffer to a specific slice of the parent's giant buffer
 		WDFMEMORY_OFFSET memOffset;
 		memOffset.BufferOffset = memoryOffset;
 		memOffset.BufferLength = chunkSize;
 
+		// Format the child request for reading
 		status = WdfIoTargetFormatRequestForRead(target, childRequest, parentMemory, &memOffset, &deviceOffset);
 
 		if (!NT_SUCCESS(status))
@@ -390,11 +442,14 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 			break;
 		}
 
+		// Hook the completion routine
 		WdfRequestSetCompletionRoutine(childRequest, EvtChildRequestCompleted, Request);
 		InterlockedIncrement(&parentCtx->OutstandingChildren);
 
+		// Send the chunk down to the disk driver
 		if (!WdfRequestSend(childRequest, target, WDF_NO_SEND_OPTIONS))
 		{
+			// If it fails immediately (e.g. device removed), record the error
 			status = WdfRequestGetStatus(childRequest);
 			WdfSpinLockAcquire(parentCtx->Lock);
 			parentCtx->FinalStatus = status;
@@ -403,10 +458,13 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 			InterlockedDecrement(&parentCtx->OutstandingChildren);
 		}
 
+		// Advance pointers for the next slice
 		memoryOffset += chunkSize;
 		deviceOffset += chunkSize;
 	}
 
+	// Remove the initial loop bias. If all chunks completed synchronously, this drops 
+	// the counter to 0 and completes the parent request.
 	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0)
 	{
 		status = parentCtx->FinalStatus;
@@ -414,6 +472,8 @@ VOID EvtIoRead(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 	}
 }
 
+// EvtIoWrite is functionally identical to EvtIoRead, 
+// except it retrieves Input memory and formats for Write.
 VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 {
 	WDFDEVICE device = WdfIoQueueGetDevice(Queue);
@@ -433,59 +493,67 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		return;
 	}
 
+	// SPLIT PATH: The request is too large. We must slice it.
 	WDF_REQUEST_PARAMETERS params;
 	WDF_REQUEST_PARAMETERS_INIT(&params);
 	WdfRequestGetParameters(Request, &params);
 	LONGLONG deviceOffset = params.Parameters.Write.DeviceOffset;
 
 	WDFMEMORY parentMemory;
-	NTSTATUS status = WdfRequestRetrieveInputMemory(Request, &parentMemory);
+	NTSTATUS status = WdfRequestRetrieveInputMemory(Request, &parentMemory); // Input memory for Write
 	if (!NT_SUCCESS(status))
 	{
 		WdfRequestComplete(Request, status);
 		return;
 	}
 
+	// Allocate a tracking context for the Parent request
 	WDF_OBJECT_ATTRIBUTES attributes;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, PARENT_REQUEST_CONTEXT);
 	PPARENT_REQUEST_CONTEXT parentCtx;
 	status = WdfObjectAllocateContext(Request, &attributes, (PVOID*)&parentCtx);
 	if (!NT_SUCCESS(status))
 	{
+		// INSUFFICIENT RESOURCES GUARD
 		WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
 		return;
 	}
 
 	parentCtx->FinalStatus = STATUS_SUCCESS;
 
+	// Create a spinlock to safely update FinalStatus later
 	WDF_OBJECT_ATTRIBUTES lockAttributes;
 	WDF_OBJECT_ATTRIBUTES_INIT(&lockAttributes);
 	lockAttributes.ParentObject = Request;
 	WdfSpinLockCreate(&lockAttributes, &parentCtx->Lock);
 
-	parentCtx->OutstandingChildren = 1;
+	parentCtx->OutstandingChildren = 1; // Initial bias
 
 	size_t memoryOffset = 0;
 
+	// Slicing loop
 	while (memoryOffset < Length)
 	{
 		size_t chunkSize = Length - memoryOffset;
-		if (chunkSize > activeSafeSize) chunkSize = activeSafeSize;
+		if (chunkSize > activeSafeSize) chunkSize = activeSafeSize; // Clamp size to hardware max
 
 		WDFREQUEST childRequest;
 		status = WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, target, &childRequest);
 		if (!NT_SUCCESS(status))
 		{
+			// INSUFFICIENT RESOURCES GUARD
 			WdfSpinLockAcquire(parentCtx->Lock);
 			parentCtx->FinalStatus = STATUS_INSUFFICIENT_RESOURCES;
 			WdfSpinLockRelease(parentCtx->Lock);
 			break;
 		}
 
+		// Map the child's buffer to a specific slice of the parent's giant buffer
 		WDFMEMORY_OFFSET memOffset;
 		memOffset.BufferOffset = memoryOffset;
 		memOffset.BufferLength = chunkSize;
 
+		// Format the child request for writing
 		status = WdfIoTargetFormatRequestForWrite(target, childRequest, parentMemory, &memOffset, &deviceOffset);
 
 		if (!NT_SUCCESS(status))
@@ -497,11 +565,14 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 			break;
 		}
 
+		// Hook the completion routine
 		WdfRequestSetCompletionRoutine(childRequest, EvtChildRequestCompleted, Request);
 		InterlockedIncrement(&parentCtx->OutstandingChildren);
 
+		// Send the chunk down to the disk driver
 		if (!WdfRequestSend(childRequest, target, WDF_NO_SEND_OPTIONS))
 		{
+			// If it fails immediately (e.g. device removed), record the error
 			status = WdfRequestGetStatus(childRequest);
 			WdfSpinLockAcquire(parentCtx->Lock);
 			parentCtx->FinalStatus = status;
@@ -510,10 +581,12 @@ VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 			InterlockedDecrement(&parentCtx->OutstandingChildren);
 		}
 
+		// Advance pointers for the next slice
 		memoryOffset += chunkSize;
 		deviceOffset += chunkSize;
 	}
 
+	// Remove loop bias
 	if (InterlockedDecrement(&parentCtx->OutstandingChildren) == 0)
 	{
 		status = parentCtx->FinalStatus;
